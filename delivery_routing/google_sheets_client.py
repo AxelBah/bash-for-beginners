@@ -42,17 +42,6 @@ def fetch_deliveries_from_sheet(
     *,
     required_headers: Iterable[str] = ("recipient", "postcode", "desired_date"),
 ) -> List[DeliveryRequest]:
-    """Load delivery requests from a Google Sheet.
-
-    Args:
-        spreadsheet_id: ID of the Google Sheet (from its URL).
-        range_name: Range to read, e.g. ``Sheet1!A1:D99``.
-        service_account_file: Path to the service account JSON used to authenticate.
-        required_headers: Column names we expect to find.
-
-    Returns:
-        List of :class:`DeliveryRequest` instances.
-    """
 
     credentials = Credentials.from_service_account_file(service_account_file, scopes=SCOPES)
     service = build("sheets", "v4", credentials=credentials)
@@ -69,14 +58,20 @@ def fetch_deliveries_from_sheet(
         raise KeyError(f"Missing columns in sheet: {', '.join(missing)}")
 
     deliveries: List[DeliveryRequest] = []
-    for row in values[1:]:
-        row_map = {header[i]: row[i].strip() if i < len(row) else "" for i in range(len(header))}
+
+    # iterate with index so we know the sheet row number
+    for i, row in enumerate(values[1:], start=2):  # row 2 on sheet = values[1]
+        row_map = {header[j]: row[j].strip() if j < len(row) else "" for j in range(len(header))}
+
         deliveries.append(
             DeliveryRequest(
                 recipient=row_map.get("recipient", ""),
                 postcode=row_map.get("postcode", ""),
                 desired_date=_parse_date(row_map.get("desired_date")),
                 notes=row_map.get("notes", "") or None,
+                row_number=i,  # <--- attach sheet row number
             )
         )
+
     return deliveries
+

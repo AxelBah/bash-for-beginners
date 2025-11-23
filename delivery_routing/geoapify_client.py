@@ -14,61 +14,104 @@ class GeoapifyClient:
         self.api_key = api_key
         self.session = session or requests.Session()
         self.country = country
+        self.base_url = "https://api.geoapify.com"
+        self.headers = {"Content-Type": "application/json"} 
 
-    def geocode_postcodes(self, postcodes: Iterable[str]) -> Dict[str, GeocodedLocation]:
-        """Turn postcodes into latitude/longitude pairs using Geoapify."""
-
-        results: Dict[str, GeocodedLocation] = {}
+    def geocode_postcodes(self, postcodes):
+        results = {}
         for postcode in postcodes:
-            query_params = {"text": postcode, "format": "json", "apiKey": self.api_key}
+            if not postcode or not postcode.strip():
+                # optionally log skipped rows
+                continue
+
+            query_params = {"text": postcode, "apiKey": self.api_key}
             if self.country:
                 query_params["filter"] = f"countrycode:{self.country}"
-            response = self.session.get("https://api.geoapify.com/v1/geocode/search", params=query_params, timeout=20)
+
+            response = self.session.get(
+                "https://api.geoapify.com/v1/geocode/search",
+                params=query_params,
+                timeout=20
+            )
+
             response.raise_for_status()
             payload = response.json()
             features = payload.get("features", [])
+
             if not features:
                 raise ValueError(f"Geoapify could not geocode postcode '{postcode}'")
 
-            geometry = features[0]["geometry"]["coordinates"]
+            lon, lat = features[0]["geometry"]["coordinates"]
             results[postcode] = GeocodedLocation(
                 identifier=postcode,
-                longitude=geometry[0],
-                latitude=geometry[1],
+                longitude=lon,
+                latitude=lat,
                 raw=features[0],
             )
+
         return results
 
-    def route_matrix(self, coordinates: Sequence[GeocodedLocation], *, mode: str = "drive") -> List[List[float]]:
-        """Create a square matrix of travel times in minutes between coordinates."""
 
-        locations = [
-            {
-                "location": [location.longitude, location.latitude],
-                "id": location.identifier,
+
+    def route_matrix(self, locations, edges):
+        """
+        Compute only selected origin→destination distances.
+        locations: list of GeocodedLocation (index 0 = depot)
+        edges: list of (origin, dest) index pairs
+        """
+        print("EDGE COUNT:", len(edges))
+        print("UNIQUE ORIGINS:", len({o for (o, _) in edges}))
+        print("UNIQUE DESTS:", len({d for (_, d) in edges}))
+        if edges is None or not edges:
+            raise ValueError("route_matrix must be called with edges list")
+
+        # Convert input coords once
+        geo = [
+            {"location": [loc.longitude, loc.latitude]}
+            for loc in locations
+        ]
+
+        results = {}
+        BATCH = 300  # Must be << 1000 to avoid Geoapify limit
+
+        def call(batch):
+            origins = sorted({o for (o, _) in batch})
+            dests   = sorted({d for (_, d) in batch})
+
+            body = {
+                "mode": "drive",
+                "sources": [geo[o] for o in origins],
+                "targets": [geo[d] for d in dests]
             }
-            for location in coordinates
-        ]
-        body = {
-            "mode": mode,
-            "sources": list(range(len(locations))),
-            "targets": list(range(len(locations))),
-            "locations": locations,
-        }
-        response = self.session.post(
-            "https://api.geoapify.com/v1/routematrix",
-            params={"apiKey": self.api_key},
-            json=body,
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        durations = payload.get("sources_to_targets", [])
-        if not durations:
-            raise ValueError("Geoapify returned an empty matrix response")
 
-        # durations are in seconds in the same order as submitted locations
-        return [
-            [float(cell["time"] / 60.0) for cell in row]
-            for row in durations
-        ]
+            url = f"{self.base_url}/v1/routematrix"
+            params = {"apiKey": self.api_key}
+
+            r = self.session.post(url, params=params, json=body, headers=self.headers)
+            if not r.ok:
+                print("ERROR:", r.text)
+                r.raise_for_status()
+
+            data = r.json()
+
+            # Parse result
+            for i, o in enumerate(origins):
+                for j, d in enumerate(dests):
+                    entry = data["sources_to_targets"][i][j]
+                    results[(o, d)] = {
+                        "distance": entry.get("distance", 0),
+                        "time": entry.get("time", 0),
+                    }
+
+        # Batch edges
+        batch = []
+        for e in edges:
+            batch.append(e)
+            if len(batch) >= BATCH:
+                call(batch)
+                batch = []
+
+        if batch:
+            call(batch)
+
+        return results

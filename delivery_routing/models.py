@@ -13,6 +13,7 @@ class DeliveryRequest:
     postcode: str
     desired_date: date
     notes: Optional[str] = None
+    row_number: int | None = None
 
 
 @dataclass

@@ -10,11 +10,11 @@ from .models import DayPlan, DeliveryRequest, GeocodedLocation
 from .routing import build_day_plan
 
 
+
 def _load_geo_locations(client: GeoapifyClient, *, depot_address: str, postcodes: Iterable[str]) -> tuple[GeocodedLocation, Dict[str, GeocodedLocation]]:
     depot_location = client.geocode_postcodes([depot_address])[depot_address]
     postcode_locations = client.geocode_postcodes(postcodes)
     return depot_location, postcode_locations
-
 
 def _haversine_km(a: GeocodedLocation, b: GeocodedLocation) -> float:
     """Calculate haversine distance in kilometers."""
@@ -33,25 +33,35 @@ def _cluster_by_proximity(
     deliveries: Sequence[DeliveryRequest],
     locations: Dict[str, GeocodedLocation],
     *,
-    max_group_km: float = 12.0,
+    max_group_km: float = 5.0,
 ) -> List[List[DeliveryRequest]]:
-    """Greedy proximity clustering so nearby postcodes share a delivery day.
+    """Greedy geographic clustering based on Haversine distance."""
 
-    Each cluster is seeded with a single delivery; new deliveries join the first cluster
-    where they are within ``max_group_km`` of any member. This keeps geographically-close
-    postcodes together without heavy computation.
-    """
+    # Sort deliveries by physical position, not by sheet order
+    deliveries = sorted(
+        deliveries,
+        key=lambda d: (locations[d.postcode].latitude, locations[d.postcode].longitude)
+    )
 
     clusters: List[List[DeliveryRequest]] = []
+
     for request in deliveries:
         placed = False
         for cluster in clusters:
-            if any(_haversine_km(locations[request.postcode], locations[existing.postcode]) <= max_group_km for existing in cluster):
+            if any(
+                _haversine_km(
+                    locations[request.postcode], 
+                    locations[existing.postcode]
+                ) <= max_group_km
+                for existing in cluster
+            ):
                 cluster.append(request)
                 placed = True
                 break
+
         if not placed:
             clusters.append([request])
+
     return clusters
 
 
@@ -73,12 +83,24 @@ def plan_routes(
         raise ValueError("No deliveries were found in the provided sheet range")
 
     client = GeoapifyClient(geoapify_key, country=country)
-    depot, postcode_locations = _load_geo_locations(client, depot_address=depot_address, postcodes=grouped_postcodes(deliveries))
+    depot, postcode_locations = _load_geo_locations(
+        client,
+        depot_address=depot_address,
+        postcodes=grouped_postcodes(deliveries),
+    )
+    print("POSTCODES:", grouped_postcodes(deliveries))
 
-    clusters = _cluster_by_proximity(sorted(deliveries, key=lambda d: d.desired_date), postcode_locations)
+    clusters = _cluster_by_proximity(
+    sorted(deliveries,
+           key=lambda d: (postcode_locations[d.postcode].latitude,
+                          postcode_locations[d.postcode].longitude)),
+    postcode_locations
+)
+
 
     plans: List[DayPlan] = []
     for cluster in clusters:
+        print("CLUSTER SIZE:", len(cluster))
         deadline = min(req.desired_date for req in cluster)
         plan = build_day_plan(
             deadline,
@@ -93,8 +115,8 @@ def plan_routes(
     return plans
 
 
-def grouped_postcodes(deliveries: Iterable[DeliveryRequest]) -> List[str]:
-    postcodes = {req.postcode for req in deliveries}
+def grouped_postcodes(deliveries):
+    postcodes = {req.postcode.strip() for req in deliveries if req.postcode.strip()}
     return sorted(postcodes)
 
 
