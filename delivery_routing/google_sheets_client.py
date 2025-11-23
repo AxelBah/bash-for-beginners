@@ -26,6 +26,7 @@ def _parse_date(value: str):
         lambda v: datetime.fromisoformat(v).date(),
         lambda v: datetime.strptime(v, "%d/%m/%Y").date(),
         lambda v: datetime.strptime(v, "%m/%d/%Y").date(),
+        lambda v: datetime.strptime(v, "%A, %B %d, %Y").date(),
     ):
         try:
             return parser(str(value))
