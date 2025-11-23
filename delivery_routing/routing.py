@@ -2,198 +2,143 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, Sequence, Tuple
 
-import math
 from .models import DayPlan, DeliveryRequest, GeocodedLocation
 
 
-# --------------------------
-# Haversine distance (km)
-# --------------------------
+def _build_edges(path: Sequence[str]) -> List[Tuple[str, str]]:
+    """Return ordered edges along a closed path (Depot already included)."""
 
-def _haversine(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    R = 6371
-    lat1, lon1 = a
-    lat2, lon2 = b
-
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lat2 - lon1)
-
-    h = (math.sin(dlat / 2) ** 2 +
-         math.cos(math.radians(lat1))
-         * math.cos(math.radians(lat2))
-         * math.sin(dlon / 2) ** 2)
-
-    return 2 * R * math.asin(math.sqrt(h))
+    return list(zip(path[:-1], path[1:]))
 
 
-# --------------------------
-# Nearest Neighbor Route
-# --------------------------
+class _EdgeFetcher:
+    """Cache-aware helper that batches sparse Geoapify matrix requests."""
 
-def _nearest_neighbor_order(coords: List[Tuple[float, float]]) -> List[int]:
-    """
-    Returns a list of indices in the order visited.
-    coords[0] = depot.
-    Uses pure Haversine distance (fast, no API calls).
-    """
-    n = len(coords)
-    unvisited = set(range(1, n))
-    order = [0]
-    current = 0
+    def __init__(
+        self,
+        client,
+        locations: Dict[str, GeocodedLocation],
+        *,
+        mode: str = "drive",
+        max_cells: int = 1000,
+    ):
+        self.client = client
+        self.locations = locations
+        self.mode = mode
+        self.max_cells = max_cells
+        self._cache: Dict[Tuple[str, str], float] = {}
 
-    while unvisited:
-        nxt = min(unvisited, key=lambda i: _haversine(coords[current], coords[i]))
-        order.append(nxt)
-        unvisited.remove(nxt)
-        current = nxt
+    def ensure_times(self, origins: Iterable[str], targets: Iterable[str]):
+        origin_ids = list(dict.fromkeys(origins))
+        target_ids = list(dict.fromkeys(targets))
 
-    return order
+        for origin in origin_ids:
+            needed = [t for t in target_ids if t != origin and (origin, t) not in self._cache]
+            if not needed:
+                continue
 
+            start = 0
+            while start < len(needed):
+                # With a single origin, the cell count equals the number of targets.
+                chunk = needed[start : start + self.max_cells]
+                durations = self.client.route_matrix(
+                    [self.locations[origin]],
+                    [self.locations[target] for target in chunk],
+                    mode=self.mode,
+                )
+                for (orig, dest), minutes in durations.items():
+                    self._cache[(orig, dest)] = minutes
+                start += self.max_cells
 
-# --------------------------
-# Build a SMALL edge list
-# --------------------------
-
-def _build_edges(coordinates: List[GeocodedLocation]):
-    """
-    Build a SAFE and SMALL set of edges for Geoapify.
-    This prevents full NxN matrix requests.
-
-    Includes only:
-      - depot → all stops
-      - nearest-neighbor chain between stops
-      - last stop → depot
-    """
-
-    n = len(coordinates)
-    edges = set()
-
-    # Convert to (lat, lon) for NN logic
-    coords_latlon = [(loc.latitude, loc.longitude) for loc in coordinates]
-
-    depot = 0
-
-    # 1. Depot → all stops
-    for i in range(1, n):
-        edges.add((depot, i))
-
-    # 2. Nearest-neighbor chain
-    unvisited = set(range(1, n))
-    current = depot
-
-    while unvisited:
-        next_idx = min(
-            unvisited,
-            key=lambda j: _haversine(coords_latlon[current], coords_latlon[j])
-        )
-        edges.add((current, next_idx))
-        current = next_idx
-        unvisited.remove(next_idx)
-
-    # Last stop → depot
-    edges.add((current, depot))
-
-    return edges
+    def get_time(self, origin: str, target: str) -> float:
+        if origin == target:
+            return 0.0
+        if (origin, target) not in self._cache:
+            self.ensure_times([origin], [target])
+        return self._cache[(origin, target)]
 
 
-# --------------------------
-# Route length helper
-# --------------------------
-
-def _route_length(order: List[int], coords: List[Tuple[float, float]]) -> float:
-    return sum(_haversine(coords[a], coords[b]) for a, b in zip(order, order[1:]))
+def _route_drive_minutes(path: Sequence[str], fetcher: _EdgeFetcher) -> float:
+    edges = _build_edges(path)
+    fetcher.ensure_times((a for a, _ in edges), (b for _, b in edges))
+    return sum(fetcher.get_time(origin, target) for origin, target in edges)
 
 
-# --------------------------
-# 2-opt improvement
-# --------------------------
+def _nearest_neighbor_route(stops: List[str], fetcher: _EdgeFetcher, depot_id: str) -> Tuple[List[str], float, List[str]]:
+    remaining = stops.copy()
+    order: List[str] = []
+    current = depot_id
 
-def _two_opt(order: List[int], coords: List[Tuple[float, float]]) -> List[int]:
+    while remaining:
+        fetcher.ensure_times([current], remaining)
+        next_stop = min(remaining, key=lambda stop: (fetcher.get_time(current, stop), stop))
+        order.append(next_stop)
+        remaining.remove(next_stop)
+        current = next_stop
+
+    path = [depot_id] + order + [depot_id]
+    drive_minutes = _route_drive_minutes(path, fetcher)
+    return order, drive_minutes, path
+
+
+def _two_opt(path: List[str], fetcher: _EdgeFetcher) -> Tuple[List[str], float]:
+    best = path
+    best_cost = _route_drive_minutes(best, fetcher)
     improved = True
-    best = order
-    best_len = _route_length(best, coords)
 
     while improved:
         improved = False
         for i in range(1, len(best) - 2):
-            for j in range(i + 1, len(best) - 1):
-                new_route = best[:i] + best[i:j][::-1] + best[j:]
-                new_len = _route_length(new_route, coords)
-                if new_len < best_len:
-                    best = new_route
-                    best_len = new_len
+            for k in range(i + 1, len(best) - 1):
+                if k == i + 1:
+                    continue  # swapping adjacent edges yields no change
+                candidate = best[:i] + best[i : k + 1][::-1] + best[k + 1 :]
+                candidate_cost = _route_drive_minutes(candidate, fetcher)
+                if candidate_cost + 1e-6 < best_cost:
+                    best = candidate
+                    best_cost = candidate_cost
                     improved = True
+                    break
+            if improved:
+                break
+    return best, best_cost
 
-    return best
-
-
-# --------------------------
-# Build daily plan
-# --------------------------
 
 def build_day_plan(
     date_label,
     deliveries: Iterable[DeliveryRequest],
     geo_locations: Dict[str, GeocodedLocation],
     depot: GeocodedLocation,
-    matrix_builder,
+    geo_client,
     *,
     service_minutes_per_stop: float = 10.0,
     max_workday_minutes: float = 8 * 60,
 ) -> DayPlan:
+    """Create a :class:`DayPlan` from deliveries scheduled on the same day."""
 
     requests = list(deliveries)
     if not requests:
         raise ValueError("At least one delivery is required to build a day plan")
 
-    # ------------------------------
-    # Build coordinate list
-    # ------------------------------
-    coordinates = [depot] + [geo_locations[r.postcode] for r in requests]
-    labels = ["Depot"] + [r.postcode for r in requests]
+    locations: Dict[str, GeocodedLocation] = {depot.identifier: depot}
+    for req in requests:
+        locations[req.postcode] = geo_locations[req.postcode]
 
-    # ------------------------------
-    # Build Haversine route order
-    # ------------------------------
-    coords_latlon = [(loc.latitude, loc.longitude) for loc in coordinates]
+    stop_ids = [req.postcode for req in requests]
+    fetcher = _EdgeFetcher(geo_client, locations)
 
-    order = _nearest_neighbor_order(coords_latlon)
-    order = _two_opt(order, coords_latlon)
-
-    # ------------------------------
-    # Build required edges for Geoapify
-    # ------------------------------
-    edges = [(a, b) for a, b in zip(order, order[1:])]
-    edges.append((order[-1], order[0]))  # Return to depot
-
-    # ------------------------------
-    # Query Geoapify for these edges only
-    # ------------------------------
-    matrix = matrix_builder(coordinates, edges=edges)
-
-    # ------------------------------
-    # Compute drive time
-    # ------------------------------
-    drive_minutes = sum(
-        matrix[(a, b)]["time"] / 60.0
-        for (a, b) in edges
-        if (a, b) in matrix
-    )
+    stop_order, drive_minutes, path = _nearest_neighbor_route(stop_ids, fetcher, depot.identifier)
+    improved_path, drive_minutes = _two_opt(path, fetcher)
 
     service_minutes = len(requests) * service_minutes_per_stop
     total_minutes = drive_minutes + service_minutes
     feasible = total_minutes <= max_workday_minutes
-    reason = None if feasible else f"Estimated {total_minutes:.1f} min exceeds limit"
-
-    # ------------------------------
-    # Build final stop order labels (excluding depot idx 0)
-    # ------------------------------
-    stop_order_labels = [labels[i] for i in order[1:]]
+    reason = None if feasible else f"Estimated {total_minutes:.1f} min exceeds workday limit ({max_workday_minutes} min)"
 
     return DayPlan(
         date=date_label,
         requests=requests,
-        stop_order=stop_order_labels,
+        stop_order=improved_path[1:-1],
         drive_minutes=drive_minutes,
         service_minutes=service_minutes,
         feasible=feasible,

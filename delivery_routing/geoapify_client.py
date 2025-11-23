@@ -14,104 +14,103 @@ class GeoapifyClient:
         self.api_key = api_key
         self.session = session or requests.Session()
         self.country = country
-        self.base_url = "https://api.geoapify.com"
-        self.headers = {"Content-Type": "application/json"} 
 
-    def geocode_postcodes(self, postcodes):
-        results = {}
+    def geocode_postcodes(self, postcodes: Iterable[str]) -> Dict[str, GeocodedLocation]:
+        """Turn postcodes into latitude/longitude pairs using Geoapify."""
+
+        results: Dict[str, GeocodedLocation] = {}
         for postcode in postcodes:
-            if not postcode or not postcode.strip():
-                # optionally log skipped rows
-                continue
-
-            query_params = {"text": postcode, "apiKey": self.api_key}
+            query_params = {"text": postcode, "format": "json", "apiKey": self.api_key}
             if self.country:
                 query_params["filter"] = f"countrycode:{self.country}"
-
-            response = self.session.get(
-                "https://api.geoapify.com/v1/geocode/search",
-                params=query_params,
-                timeout=20
-            )
-
+            response = self.session.get("https://api.geoapify.com/v1/geocode/search", params=query_params, timeout=20)
             response.raise_for_status()
             payload = response.json()
             features = payload.get("features", [])
-
             if not features:
                 raise ValueError(f"Geoapify could not geocode postcode '{postcode}'")
 
-            lon, lat = features[0]["geometry"]["coordinates"]
+            geometry = features[0]["geometry"]["coordinates"]
             results[postcode] = GeocodedLocation(
                 identifier=postcode,
-                longitude=lon,
-                latitude=lat,
+                longitude=geometry[0],
+                latitude=geometry[1],
                 raw=features[0],
             )
-
         return results
 
+    def route_matrix(
+        self,
+        origins: Sequence[GeocodedLocation],
+        targets: Sequence[GeocodedLocation],
+        *,
+        mode: str = "drive",
+    ) -> Dict[tuple[str, str], float]:
+        """Request only the origin→target cells needed for routing.
 
-
-    def route_matrix(self, locations, edges):
+        Geoapify limits each matrix to ``sources * targets <= 1000`` cells. Origins
+        and targets are deduplicated (while preserving order) so callers can submit
+        sparse batches without inflating the matrix size. The return value is a
+        mapping ``(origin_id, target_id) -> minutes`` for the requested cells.
         """
-        Compute only selected origin→destination distances.
-        locations: list of GeocodedLocation (index 0 = depot)
-        edges: list of (origin, dest) index pairs
-        """
-        print("EDGE COUNT:", len(edges))
-        print("UNIQUE ORIGINS:", len({o for (o, _) in edges}))
-        print("UNIQUE DESTS:", len({d for (_, d) in edges}))
-        if edges is None or not edges:
-            raise ValueError("route_matrix must be called with edges list")
 
-        # Convert input coords once
-        geo = [
-            {"location": [loc.longitude, loc.latitude]}
-            for loc in locations
-        ]
+        def _dedupe(sequence: Sequence[GeocodedLocation]):
+            seen = set()
+            ordered: List[GeocodedLocation] = []
+            for item in sequence:
+                if item.identifier in seen:
+                    continue
+                seen.add(item.identifier)
+                ordered.append(item)
+            return ordered
 
-        results = {}
-        BATCH = 300  # Must be << 1000 to avoid Geoapify limit
+        unique_origins = _dedupe(origins)
+        unique_targets = _dedupe(targets)
 
-        def call(batch):
-            origins = sorted({o for (o, _) in batch})
-            dests   = sorted({d for (_, d) in batch})
+        # Build a combined location list so source/target indices line up correctly.
+        index_by_id: Dict[str, int] = {}
+        locations: List[GeocodedLocation] = []
+        for loc in unique_origins + unique_targets:
+            if loc.identifier in index_by_id:
+                continue
+            index_by_id[loc.identifier] = len(locations)
+            locations.append(loc)
 
-            body = {
-                "mode": "drive",
-                "sources": [geo[o] for o in origins],
-                "targets": [geo[d] for d in dests]
-            }
+        sources = [index_by_id[loc.identifier] for loc in unique_origins]
+        target_indices = [index_by_id[loc.identifier] for loc in unique_targets]
 
-            url = f"{self.base_url}/v1/routematrix"
-            params = {"apiKey": self.api_key}
+        if sources and target_indices and len(sources) * len(target_indices) > 1000:
+            raise ValueError("Route matrix request exceeds Geoapify cell limit (1000)")
 
-            r = self.session.post(url, params=params, json=body, headers=self.headers)
-            if not r.ok:
-                print("ERROR:", r.text)
-                r.raise_for_status()
+        body = {
+            "mode": mode,
+            "sources": sources,
+            "targets": target_indices,
+            "locations": [
+                {
+                    "location": [loc.longitude, loc.latitude],
+                    "id": loc.identifier,
+                }
+                for loc in locations
+            ],
+        }
+        response = self.session.post(
+            "https://api.geoapify.com/v1/routematrix",
+            params={"apiKey": self.api_key},
+            json=body,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        durations = payload.get("sources_to_targets", [])
+        if not durations:
+            raise ValueError("Geoapify returned an empty matrix response")
 
-            data = r.json()
+        times: Dict[tuple[str, str], float] = {}
+        for origin_idx, row in enumerate(durations):
+            origin_id = unique_origins[origin_idx].identifier
+            for target_idx, cell in enumerate(row):
+                target_id = unique_targets[target_idx].identifier
+                times[(origin_id, target_id)] = float(cell["time"] / 60.0)
 
-            # Parse result
-            for i, o in enumerate(origins):
-                for j, d in enumerate(dests):
-                    entry = data["sources_to_targets"][i][j]
-                    results[(o, d)] = {
-                        "distance": entry.get("distance", 0),
-                        "time": entry.get("time", 0),
-                    }
-
-        # Batch edges
-        batch = []
-        for e in edges:
-            batch.append(e)
-            if len(batch) >= BATCH:
-                call(batch)
-                batch = []
-
-        if batch:
-            call(batch)
-
-        return results
+        return times

@@ -37,6 +37,7 @@ python -m delivery_routing.delivery_planner \
   --country gb \
   --service-minutes 12 \
   --workday-minutes 480
+  --max-group-km 12
 ```
 
 > **Note for zsh users:** zsh treats `!` as history expansion, so the `--range` value `Sheet1!A1:D99` will error unless you either:
@@ -52,6 +53,7 @@ Key flags:
 - `--service-account`: Path to your Google Cloud service account JSON file with Sheets access.
 - `--geoapify-key`: Geoapify API key (or set `GEOAPIFY_API_KEY`).
 - `--depot`: Address/postcode to start and end routes.
+- `--max-group-km`: Maximum distance (in km) between any two postcodes that can share a delivery day (default 12).
 - `--country`: Optional country code to narrow geocoding results.
 - `--service-minutes`: Minutes spent at each stop.
 - `--workday-minutes`: Maximum minutes allowed per day (drive + service).
@@ -62,10 +64,10 @@ The output shows each delivery day with the stop order and whether it fits withi
 
 1. Read delivery rows from the Google Sheet via the Sheets API.
 2. Geocode the depot and all unique delivery postcodes with Geoapify.
-3. Greedily cluster deliveries whose postcodes are within ~12 km of one another so nearby stops share the same delivery day.
+3. Cluster deliveries so every pair of postcodes in a cluster is within `--max-group-km` (default 12 km), keeping clustering deterministic by ordering locations geographically.
 4. Assign each cluster a delivery day on or before the earliest `desired_date` deadline in that cluster.
-5. Use Geoapify's route matrix to estimate drive times between all stops in the cluster.
-6. Build a nearest-neighbor route for each day and flag feasibility based on drive + service time.
+5. Build a route per cluster using nearest-neighbor ordering followed by a 2-opt improvement pass. Only the Geoapify edges actually used by the route are requested, with batching to stay under the 1000 cell route-matrix limit.
+6. Flag each day as feasible if drive + service time fits inside your configured workday.
 
 ## Environment variables
 

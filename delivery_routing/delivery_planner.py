@@ -10,11 +10,11 @@ from .models import DayPlan, DeliveryRequest, GeocodedLocation
 from .routing import build_day_plan
 
 
-
 def _load_geo_locations(client: GeoapifyClient, *, depot_address: str, postcodes: Iterable[str]) -> tuple[GeocodedLocation, Dict[str, GeocodedLocation]]:
     depot_location = client.geocode_postcodes([depot_address])[depot_address]
     postcode_locations = client.geocode_postcodes(postcodes)
     return depot_location, postcode_locations
+
 
 def _haversine_km(a: GeocodedLocation, b: GeocodedLocation) -> float:
     """Calculate haversine distance in kilometers."""
@@ -33,35 +33,37 @@ def _cluster_by_proximity(
     deliveries: Sequence[DeliveryRequest],
     locations: Dict[str, GeocodedLocation],
     *,
-    max_group_km: float = 5.0,
+    max_group_km: float = 12.0,
 ) -> List[List[DeliveryRequest]]:
-    """Greedy geographic clustering based on Haversine distance."""
+    """Group deliveries so every pair within a cluster is <= ``max_group_km`` apart.
 
-    # Sort deliveries by physical position, not by sheet order
-    deliveries = sorted(
+    Requests are ordered by latitude/longitude to keep clustering deterministic and
+    geography-driven (not spreadsheet order). A delivery joins the first cluster where
+    it is within the distance threshold to **all** members, ensuring clusters never
+    span postcodes farther apart than allowed.
+    """
+
+    ordered = sorted(
         deliveries,
-        key=lambda d: (locations[d.postcode].latitude, locations[d.postcode].longitude)
+        key=lambda req: (
+            locations[req.postcode].latitude,
+            locations[req.postcode].longitude,
+            req.desired_date,
+            req.postcode,
+        ),
     )
 
     clusters: List[List[DeliveryRequest]] = []
-
-    for request in deliveries:
-        placed = False
+    for request in ordered:
         for cluster in clusters:
-            if any(
-                _haversine_km(
-                    locations[request.postcode], 
-                    locations[existing.postcode]
-                ) <= max_group_km
+            if all(
+                _haversine_km(locations[request.postcode], locations[existing.postcode]) <= max_group_km
                 for existing in cluster
             ):
                 cluster.append(request)
-                placed = True
                 break
-
-        if not placed:
+        else:
             clusters.append([request])
-
     return clusters
 
 
@@ -74,6 +76,7 @@ def plan_routes(
     depot_address: str,
     service_minutes_per_stop: float = 10.0,
     workday_minutes: float = 8 * 60,
+    max_group_km: float = 12.0,
     country: str | None = None,
 ) -> List[DayPlan]:
     """Build a list of day plans using Google Sheets + Geoapify."""
@@ -83,31 +86,19 @@ def plan_routes(
         raise ValueError("No deliveries were found in the provided sheet range")
 
     client = GeoapifyClient(geoapify_key, country=country)
-    depot, postcode_locations = _load_geo_locations(
-        client,
-        depot_address=depot_address,
-        postcodes=grouped_postcodes(deliveries),
-    )
-    print("POSTCODES:", grouped_postcodes(deliveries))
+    depot, postcode_locations = _load_geo_locations(client, depot_address=depot_address, postcodes=grouped_postcodes(deliveries))
 
-    clusters = _cluster_by_proximity(
-    sorted(deliveries,
-           key=lambda d: (postcode_locations[d.postcode].latitude,
-                          postcode_locations[d.postcode].longitude)),
-    postcode_locations
-)
-
+    clusters = _cluster_by_proximity(deliveries, postcode_locations, max_group_km=max_group_km)
 
     plans: List[DayPlan] = []
     for cluster in clusters:
-        print("CLUSTER SIZE:", len(cluster))
         deadline = min(req.desired_date for req in cluster)
         plan = build_day_plan(
             deadline,
             cluster,
             postcode_locations,
             depot,
-            client.route_matrix,
+            client,
             service_minutes_per_stop=service_minutes_per_stop,
             max_workday_minutes=workday_minutes,
         )
@@ -115,8 +106,8 @@ def plan_routes(
     return plans
 
 
-def grouped_postcodes(deliveries):
-    postcodes = {req.postcode.strip() for req in deliveries if req.postcode.strip()}
+def grouped_postcodes(deliveries: Iterable[DeliveryRequest]) -> List[str]:
+    postcodes = {req.postcode for req in deliveries}
     return sorted(postcodes)
 
 
@@ -130,6 +121,7 @@ def _build_parser():
     parser.add_argument("--country", help="Optional country code to narrow geocoding results (e.g. 'gb')")
     parser.add_argument("--service-minutes", type=float, default=10.0, help="Minutes spent per stop")
     parser.add_argument("--workday-minutes", type=float, default=8 * 60, help="Maximum minutes allowed in a day")
+    parser.add_argument("--max-group-km", type=float, default=12.0, help="Maximum distance (km) between any two postcodes in a cluster")
     return parser
 
 
@@ -164,6 +156,7 @@ def main(argv: List[str] | None = None):
         depot_address=args.depot,
         service_minutes_per_stop=args.service_minutes,
         workday_minutes=args.workday_minutes,
+        max_group_km=args.max_group_km,
         country=args.country,
     )
 
